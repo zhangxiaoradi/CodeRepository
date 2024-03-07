@@ -1,0 +1,109 @@
+// Precomputed prior knowledage
+//global spatiotemporal stable training samples after refining from the GWL_FCS30-2020 sample library
+var global_trainSample_library=ee.FeatureCollection('users/pedroabasta302/global_trainSamples_library');
+//refering the work of GWL_FCS30-2020 in how to determine the maximum extends of coastal wetlands and inland wetlands from multisourced wetland-related products
+//GWL_FCS30: a global 30 m wetland map with a fine classification system using multi-sourced and time-series remote sensing imagery in 2020
+var global_coastWetland_maxBounds=ee.ImageCollection('users/pedroabasta302/global_coastalWetland_maxBoundary');
+var global_inlandWetland_maxBounds=ee.ImageCollection('users/pedroabasta302/global_inlandWetland_maxBoundary');
+
+// left_lon and left_lat should be changed according to the mapping tile
+var left_lon=120,left_lat=35,tileLag=5;
+
+//
+function applyScaleFactors(image)
+{
+  var opticalBands = image.select('B.').multiply(0.0000275).add(-0.2).multiply(10000.0);
+  return image.addBands(opticalBands, null, true)
+}
+//
+var cloudShadowMask=function(image)
+{
+  var cloudShadowBitMask = 1 << 4;
+  var snowBitMask = 1<<5;
+  var cloudsBitMask = 1 << 3;
+  var qa = image.select('QA_PIXEL');
+  var mask = qa.bitwiseAnd(cloudShadowBitMask).eq(0).and(qa.bitwiseAnd(cloudsBitMask).eq(0))
+               .and(qa.bitwiseAnd(snowBitMask).eq(0))
+
+  return image.updateMask(mask)
+}
+
+//
+function Landsat_vis(image)
+{
+  var ndwi=image.expression('(bg-bnir)/(bg+bnir)',{'bg':image.select('B3'),'bnir':image.select('B5')});
+  var ndvi=image.expression('(bnir-br)/(br+bnir)',{'br':image.select('B4'),'bnir':image.select('B5')}).rename('NDVI');
+  var lswi=image.expression('(bnir-bswir)/(bswir+bnir)',{'bnir':image.select('B5'),'bswir':image.select('B6')});
+  var evi=image.expression('(b5-b4)*2.5/(b5+6*b4-7.5*b2+10000.0)',{'b2':image.select('B2'),'b4':image.select('B4'),'b5':image.select('B5')});
+  var mndwi=image.expression('(bg-bswir)/(bg+bswir)',{'bg':image.select('B3'),'bswir':image.select('B6')});
+  var LtideI=image.expression('(bnir-bmax)/(bmax+bnir+1000)',{'bmax':image.select([1,2,5]).reduce(ee.Reducer.max()),'bnir':image.select('B5')}).rename('LTideI');
+
+  return image.addBands(ndwi.rename('NDWI')).addBands(ndvi.rename('NDVI')).addBands(lswi.rename('LSWI'))
+              .addBands(evi.rename('EVI')).addBands(mndwi.rename('mNDWI')).addBands(LtideI.rename('LTideI'));
+}
+
+var region=ee.Geometry.Polygon([[[left_lon,left_lat],[left_lon+tileLag,left_lat],[left_lon+tileLag,left_lat-tileLag],[left_lon,left_lat-tileLag]]],'EPSG:4326',false)
+var L8_bands=['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7','QA_PIXEL'];
+var L5_bands=['SR_B1','SR_B2','SR_B3','SR_B4','SR_B5','SR_B7','QA_PIXEL'];
+var L8_renames=['B2','B3','B4','B5','B6','B7','QA_PIXEL'];
+var fbands=['B2','B3','B4','B5','B6','B7','NDVI','LSWI','mNDWI','LTideI']
+var dataset= ee.ImageCollection('LANDSAT/LC08/C02/T1_L2').select(L8_bands,L8_renames)
+      .merge(ee.ImageCollection('LANDSAT/LC09/C02/T1_L2').select(L8_bands,L8_renames))
+      .merge(ee.ImageCollection('LANDSAT/LE07/C02/T1_L2').select(L5_bands,L8_renames))
+      .merge(ee.ImageCollection('LANDSAT/LT05/C02/T1_L2').select(L5_bands,L8_renames))
+      .filterBounds(region)
+      .filterDate('2000-01-01','2022-12-31')
+      .filterMetadata('CLOUD_COVER','less_than',90)
+      .map(applyScaleFactors)
+      .map(cloudShadowMask).map(Landsat_vis);
+var alos_demCol=ee.ImageCollection('JAXA/ALOS/AW3D30/V3_2').select('DSM')
+var alos_elevation=alos_demCol.mosaic().clip(region).unmask(0);//
+var proj = alos_demCol.first().select(0).projection();
+var alos_slope=ee.Terrain.slope(alos_elevation.setDefaultProjection(proj));
+var terrains=alos_elevation.addBands(alos_slope);
+
+//
+var tile_coastMask=global_coastWetland_maxBounds.filterBounds(region).mosaic().clip(region);
+var tile_inlandMask=global_inlandWetland_maxBounds.filterBounds(region).mosaic().clip(region);
+var GWL_FCS30_annualmaps=ee.Image([]);
+for(var iepoch=2000;iepoch<=2022;iepoch++)
+{
+  var epoch_col=dataset.filterDate(iepoch+'-01-01',iepoch+'-12-31');
+  var epoch_highTide=epoch_col.select(['B2','B3','B4','B5','B6','B7','mNDWI','LTideI']).qualityMosaic('mNDWI');
+  var epoch_lowrTide=epoch_col.select(['B2','B3','B4','B5','B6','B7','mNDWI','LTideI']).qualityMosaic('LTideI');
+  var epoch_percentiles=epoch_col.select(fbands).reduce(ee.Reducer.percentile([10,30,50,70,90]));
+  var epoch_textures=epoch_percentiles.select(['B5_p10','B5_p30','B5_p50','B5_p70','B5_p90']).multiply(10000).toInt().glcmTexture(3).select([8,1,3,4,2]);
+
+  var train_features=epoch_highTide.addBands(epoch_lowrTide).addBands(epoch_percentiles).addBands(epoch_textures).add(terrains).clip(region);
+  var local_trainsamples=global_trainSample_library.filterBounds(region); //180: permanent water, 181: swamp, 182: marsh, 183: flooded flats, 184: saline, 185: mangrove, 186: salt marsh, 187: tidal flats
+  var train_sampleFeatures=train_features.sampleRegions({collection:local_trainsamples,scale:30,tileScale:12,})
+
+  var nonwetland_sampleFeatures=train_sampleFeatures.filter(ee.Filter.lt('label',180));
+  var inlandWetland_sampleFeatures=train_sampleFeatures.filter(ee.Filter.gte('label',180)).filter(ee.Filter.lte('label',184));
+  var costalWetland_sampleFeatures=train_sampleFeatures.filter(ee.Filter.gt('label',184));
+
+  // coastal wetland mapping
+  var coast_trainData=nonwetland_sampleFeatures.merge(costalWetland_sampleFeatures);
+  var coast_rfmodel=ee.Classifier.smileRandomForest({numberOfTrees:100}).train(coast_trainData,'label',train_features.bandNames());
+  var coast_map=train_features.updateMask(tile_coastMask).classify(coast_rfmodel).unmask(0).clip(region);
+  // inland wetland mapping
+  var inland_trainData=nonwetland_sampleFeatures.merge(inlandWetland_sampleFeatures);
+  var inland_rfmodel=ee.Classifier.smileRandomForest({numberOfTrees:100}).train(inland_trainData,'label',train_features.bandNames());
+  var inland_map=train_features.updateMask(tile_inlandMask).classify(inland_rfmodel).unmask(0).clip(region);
+
+  // The coastal wetland mapping usually achieves higher accuracy than that of the inland wetland mapping
+  var epoch_tilemap=coast_map.max(inland_map);
+  GWL_FCS30_annualmaps=GWL_FCS30_annualmaps.addBands(epoch_tilemap.rename('GWL_FCS30_maps_'+iepoch));
+}
+
+var mapname='GWL_FCS30_20002022_annualMaps_E120N35';
+Export.image.toDrive(
+  {
+    image:GWL_FCS30_annualmaps.toByte(),
+    description:mapname,
+    folder:'GWL_FCS30_20002022_annualMaps',
+    scale:30,
+    region:region,
+    maxPixels:1e13,
+    crs:'EPSG:4326'
+  })
