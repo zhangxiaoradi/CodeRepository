@@ -73,7 +73,9 @@ for(var iepoch=2000;iepoch<=2022;iepoch++)
   var epoch_lowrTide=epoch_col.select(['B2','B3','B4','B5','B6','B7','mNDWI','LTideI']).qualityMosaic('LTideI');
 
   var epoch_percentiles=epoch_col.select(fbands).reduce(ee.Reducer.percentile([10,30,50,70,90]));
-  var epoch_textures=epoch_percentiles.select(['B5_p10','B5_p30','B5_p50','B5_p70','B5_p90']).multiply(10000).toInt().glcmTexture(3).select([8,1,3,4,2]);
+  var text_bands=['B5_p10','B5_p30','B5_p50','B5_p70','B5_p90']
+  var epoch_textures=epoch_percentiles.select(text_bands[0]).toInt().glcmTexture(3).select([8,1,3,4,2]);
+  for(var iband=1;iband<=4;iband++) epoch_textures=epoch_textures.addBands(epoch_percentiles.select(text_bands[iband]).toInt().glcmTexture(3).select([8,1,3,4,2]));
 
   var train_features=epoch_highTide.addBands(epoch_lowrTide).addBands(epoch_percentiles).addBands(epoch_textures).add(terrains).clip(region);
   var local_trainsamples=global_trainSample_library.filterBounds(region); //180: permanent water, 181: swamp, 182: marsh, 183: flooded flats, 184: saline, 185: mangrove, 186: salt marsh, 187: tidal flats
